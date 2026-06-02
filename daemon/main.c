@@ -914,6 +914,7 @@ static void options(int *argc, char ***argv, charp_ht templates) {
 		{ "dtx-cn-params",0,0,	G_OPTION_ARG_STRING_ARRAY,&dtx_cn_params,	"Parameters for CN generated from DTX","INT INT INT ..."},
 		{ "amr-dtx", 0,0,	G_OPTION_ARG_STRING,	&amr_dtx,		"DTX mechanism to use for AMR and AMR-WB","native|CN"},
 		{ "evs-dtx", 0,0,	G_OPTION_ARG_STRING,	&evs_dtx,		"DTX mechanism to use for EVS","native|CN"},
+		{ "evs-allow-dsp-transcode",0,0,G_OPTION_ARG_NONE,&rtpe_config.evs_allow_dsp_transcode,"LICENSING-SENSITIVE: allow transcoding native EVS primary modes via the patent-encumbered EVS codec DSP (requires --evs-lib-path). Off by default; EVS is otherwise handled by AMR-WB-IO re-framing and passthrough only.",NULL},
 		{ "silence-detect",0,0,	G_OPTION_ARG_DOUBLE,	&silence_detect,	"Audio level threshold in percent for silence detection","FLOAT"},
 		{ "cn-payload",0,0,	G_OPTION_ARG_STRING_ARRAY,&cn_payload,		"Comfort noise parameters to replace silence with","INT INT INT ..."},
 		{ "player-cache",0,0,	G_OPTION_ARG_NONE,	&rtpe_config.player_cache,"Cache media files for playback in memory",NULL},

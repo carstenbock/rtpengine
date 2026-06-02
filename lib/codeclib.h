@@ -414,6 +414,15 @@ int decoder_input_data(decoder_t *dec, const str *data, unsigned long ts,
 int decoder_input_data_ptime(decoder_t *dec, const str *data, unsigned long ts, int *ptime,
 		int (*callback)(decoder_t *, AVFrame *, void *u1, void *u2), void *u1, void *u2);
 gboolean decoder_has_dtx(decoder_t *);
+
+// Licensing-safe EVS AMR-WB-IO <-> AMR-WB (RFC 4867) re-framing. Pure
+// packetization translation; never instantiates or calls the EVS codec DSP.
+// Both return the output payload length, 0 for an empty input, or -1 on error
+// (codec_evs_io_to_amr_wb() also returns -1 for native EVS primary frames).
+int codec_evs_io_to_amr_wb(const str *in, char *out, size_t out_size, bool octet_aligned);
+int codec_amr_wb_to_evs_io(const str *in, char *out, size_t out_size,
+		bool octet_aligned, bool hf_only);
+
 int decoder_switch_dtx(decoder_t *dec, enum dtx_method);
 int decoder_set_cn_dtx(decoder_t *dec, const str *);
 int decoder_dtx(decoder_t *dec, unsigned long ts, int ptime,

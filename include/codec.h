@@ -60,6 +60,7 @@ struct codec_handler {
 	bool transcoder:1;
 	bool pcm_dtmf_detect:1;
 	bool blackhole:1;
+	bool reframe:1; // licensing-safe EVS-IO <-> AMR-WB repacketization (no DSP)
 
 	size_t payload_len; // for short-packet blocking
 

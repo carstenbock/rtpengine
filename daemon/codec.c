@@ -314,6 +314,7 @@ static codec_handler_func handler_func_inject_dtmf;
 static codec_handler_func handler_func_dtmf;
 static codec_handler_func handler_func_t38;
 static codec_handler_func handler_func_blackhole;
+static codec_handler_func handler_func_reframe;
 
 static struct ssrc_entry *__ssrc_handler_transcode_new(void *p);
 static struct ssrc_entry *__ssrc_handler_decode_new(void *p);
@@ -460,6 +461,7 @@ static void __handler_shutdown(struct codec_handler *handler) {
 	handler->passthrough = false;
 	handler->payload_len = 0;
 	handler->blackhole = false;
+	handler->reframe = false;
 
 	codec_handler_free(&handler->dtmf_injector);
 
@@ -900,6 +902,61 @@ static bool __make_audio_player_decoder(struct codec_handler *handler, rtp_paylo
 {
 	return __make_transcoder_full(handler, dest, NULL, -1, pcm_dtmf_detect, -1, packet_decoded_audio_player,
 			__ssrc_handler_decode_new);
+}
+
+// Licensing-safe EVS<->AMR-WB re-framing predicates. A PT is an EVS AMR-WB-IO
+// leg if it is the EVS codec negotiated in AMR-WB-IO mode (evs-mode-switch=1),
+// and an AMR-WB leg if it is the AMR codec at the 16 kHz (wideband) clock rate.
+// EVS-IO speech/SID frames are bit-identical to AMR-WB, so they can be
+// repacketized between the two formats without ever invoking the EVS DSP.
+static bool __reframe_pt_is_evs_io(const rtp_payload_type *pt) {
+	return pt && pt->codec_def && pt->codec_def->evs
+		&& pt->format.fmtp_parsed && pt->format.parsed.evs.amr_io;
+}
+static bool __reframe_pt_is_amr_wb(const rtp_payload_type *pt) {
+	return pt && pt->codec_def && pt->codec_def->amr && pt->clock_rate == 16000;
+}
+static bool __codec_reframe_pair(const rtp_payload_type *src, const rtp_payload_type *dst) {
+	if (__reframe_pt_is_evs_io(src) && __reframe_pt_is_amr_wb(dst))
+		return true;
+	if (__reframe_pt_is_amr_wb(src) && __reframe_pt_is_evs_io(dst))
+		return true;
+	return false;
+}
+// Find an AMR-WB (16 kHz) codec offered by the sink, to re-frame an EVS-IO
+// source into. Returns NULL if the sink has no AMR-WB codec.
+static rtp_payload_type *__reframe_find_amr_wb_sink(struct call_media *sink) {
+	for (__auto_type l = sink->codecs.codec_prefs.head; l; l = l->next) {
+		rtp_payload_type *pt = l->data;
+		if (__reframe_pt_is_amr_wb(pt))
+			return pt;
+	}
+	return NULL;
+}
+// Install the licensing-safe EVS<->AMR-WB re-frame handler. Unlike a transcoder
+// this creates no decoder, encoder, or SSRC handler and never loads the EVS .so.
+// It behaves like passthrough (same SSRC, 1:1 sequence/timestamp) but rewrites
+// the payload framing and the payload type.
+static void __make_reframe(struct codec_handler *handler, rtp_payload_type *dest) {
+	if (handler->reframe && handler->handler_func == handler_func_reframe
+			&& rtp_payload_type_eq_exact(dest, &handler->dest_pt))
+		return; // already set up identically
+
+	__handler_shutdown(handler);
+	rtp_payload_type_copy(&handler->dest_pt, dest);
+	handler->handler_func = handler_func_reframe;
+	handler->reframe = true;
+	handler->kernelize = false; // re-framing cannot be offloaded to the kernel
+
+	ilogs(codec, LOG_INFO, "Using licensing-safe EVS<->AMR-WB re-frame handler for "
+		STR_FORMAT "/" STR_FORMAT " (%i) -> " STR_FORMAT "/" STR_FORMAT " (%i) "
+		"(EVS DSP not used)",
+			STR_FMT(&handler->source_pt.encoding_with_params),
+			STR_FMT0(&handler->source_pt.format_parameters),
+			handler->source_pt.payload_type,
+			STR_FMT(&dest->encoding_with_params),
+			STR_FMT0(&dest->format_parameters),
+			dest->payload_type);
 }
 
 // used for generic playback (audio_player, t38_gateway)
@@ -1570,6 +1627,16 @@ void __codec_handlers_update(struct call_media *source, struct call_media *sink,
 
 		// check our own support for this codec
 		if (!codec_def_supported(pt->codec_def)) {
+			// We don't support this codec ourselves (e.g. EVS with no DSP .so).
+			// If it is an EVS AMR-WB-IO source and the sink offers AMR-WB, we can
+			// still bridge it by licensing-safe re-framing (no EVS DSP). This is
+			// decoupled from codec_def_supported on purpose.
+			rtp_payload_type *reframe_sink = __reframe_pt_is_evs_io(pt)
+					? __reframe_find_amr_wb_sink(sink) : NULL;
+			if (reframe_sink) {
+				__make_reframe(handler, reframe_sink);
+				goto next;
+			}
 			// not supported
 			ilogs(codec, LOG_DEBUG, "No codec support for " STR_FORMAT "/" STR_FORMAT,
 					STR_FMT(&pt->encoding_with_params),
@@ -1809,6 +1876,40 @@ sink_pt_fixed:;
 		goto next;
 
 transcode:
+		// Licensing-safe EVS<->AMR-WB re-framing takes precedence over a real
+		// transcoder for this pairing: it repacketizes EVS AMR-WB-IO frames
+		// to/from RFC 4867 AMR-WB without invoking the EVS DSP. This also covers
+		// the case where the sink is EVS but we have no DSP .so to encode it.
+		if (__codec_reframe_pair(pt, sink_pt)) {
+			__make_reframe(handler, sink_pt);
+			goto next;
+		}
+		// Any other path that involves EVS would require the patent-encumbered
+		// EVS DSP (encode or decode via the reference .so). This is
+		// licensing-sensitive and is only permitted when explicitly enabled
+		// (--evs-allow-dsp-transcode) AND the .so is actually loaded. Otherwise
+		// forward the stream untouched (native EVS passthrough); never silently
+		// invoke the EVS DSP.
+		if ((pt->codec_def && pt->codec_def->evs)
+				|| (sink_pt->codec_def && sink_pt->codec_def->evs))
+		{
+			bool dsp_ok = rtpe_config.evs_allow_dsp_transcode
+				&& codec_def_supported(pt->codec_def)
+				&& codec_def_supported(sink_pt->codec_def);
+			if (!dsp_ok) {
+				ilogs(codec, LOG_INFO, "Not transcoding EVS " STR_FORMAT " -> "
+						STR_FORMAT " via the DSP (%s); using passthrough",
+						STR_FMT(&pt->encoding_with_params),
+						STR_FMT(&sink_pt->encoding_with_params),
+						rtpe_config.evs_allow_dsp_transcode
+							? "EVS .so not loaded"
+							: "--evs-allow-dsp-transcode is off");
+				__make_passthrough_gsl(handler, &passthrough_handlers, src_dtmf_pt,
+						src_cn_pt, use_ssrc_passthrough);
+				goto next;
+			}
+		}
+
 		// enable audio player if not explicitly disabled
 		if ((rtpe_config.use_audio_player == UAP_TRANSCODING
 					&& (!a.flags || a.flags->audio_player != AP_OFF))
@@ -2235,6 +2336,66 @@ static int handler_func_passthrough(struct codec_handler *h, struct media_packet
 }
 
 #ifdef WITH_TRANSCODING
+// Licensing-safe EVS AMR-WB-IO <-> AMR-WB re-framing. Repacketizes between the
+// EVS AMR-WB-IO RTP format and RFC 4867 AMR-WB without ever invoking the EVS
+// codec DSP (no decode, no encode, no PCM). This lets EVS callers be bridged to
+// AMR-WB legs with the patent-encumbered EVS .so absent. Native EVS primary
+// frames cannot be re-framed and are dropped (with a rate-limited log) by the
+// underlying primitive; the DSP is never touched.
+static int handler_func_reframe(struct codec_handler *h, struct media_packet *mp) {
+	if (!handler_silence_block(h, mp))
+		return 0;
+
+	// we need the RTP header and an output SSRC to build the re-framed packet.
+	// without them (unexpected paths) fall back to plain passthrough.
+	if (!mp->rtp || !mp->ssrc_out)
+		return handler_func_passthrough(h, mp);
+
+	uint32_t ts = ntohl(mp->rtp->timestamp);
+	codec_calc_jitter(mp->ssrc_in, ts, h->source_pt.clock_rate, mp->tv);
+	codec_calc_lost(mp->ssrc_in, ntohs(mp->rtp->seq_num));
+
+	ML_CLEAR(mp->media->monologue, DTMF_INJECTION_ACTIVE);
+
+	// output buffer: RTP header + header extensions + re-framed payload.
+	// the re-frame primitives need room for the input plus up to 8 bytes.
+	size_t ext_len = mp->sink.rtpext->length(mp);
+	size_t payload_room = mp->payload.len + 8;
+	size_t pkt_len = sizeof(struct rtp_header) + ext_len + payload_room + RTP_BUFFER_TAIL_ROOM;
+	char *buf = bufferpool_alloc(media_bufferpool, pkt_len);
+	char *payload = buf + sizeof(struct rtp_header) + ext_len;
+
+	int out_len;
+	if (h->source_pt.codec_def && h->source_pt.codec_def->evs) {
+		// EVS AMR-WB-IO -> AMR-WB
+		bool octet_aligned = h->dest_pt.format.parsed.amr.octet_aligned;
+		out_len = codec_evs_io_to_amr_wb(&mp->payload, payload, payload_room, octet_aligned);
+	}
+	else {
+		// AMR-WB -> EVS AMR-WB-IO
+		bool octet_aligned = h->source_pt.format.parsed.amr.octet_aligned;
+		bool hf_only = h->dest_pt.format.parsed.evs.hf_only;
+		out_len = codec_amr_wb_to_evs_io(&mp->payload, payload, payload_room, octet_aligned, hf_only);
+	}
+
+	if (out_len <= 0) {
+		// out_len < 0: malformed or a native EVS primary frame (already logged,
+		// rate-limited, by the primitive). out_len == 0: nothing to send.
+		// In all cases drop the packet; the DSP is never touched.
+		bufferpool_unref(buf);
+		return 0;
+	}
+
+	struct rtp_markers marks = { .marker = (mp->rtp->m_pt & 0x80) ? true : false };
+	// EVS-IO and AMR-WB share a 16 kHz clock, so sequence numbers and timestamps
+	// map 1:1. Pass an explicit sequence number so the packet is forwarded
+	// immediately (passthrough-style), bypassing the transcode send scheduler.
+	codec_output_rtp(mp, NULL, h, buf, out_len, ts, marks,
+			ntohs(mp->rtp->seq_num), 0, h->dest_pt.payload_type, 0);
+
+	return 0;
+}
+
 static void __ssrc_lock_both(struct media_packet *mp) {
 	struct ssrc_entry_call *ssrc_in = mp->ssrc_in;
 	struct ssrc_entry_call *ssrc_out = mp->ssrc_out;

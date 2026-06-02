@@ -87,6 +87,7 @@ include ../lib/common.Makefile
 TESTS := test-bitstr aes-crypt aead-aes-crypt test-const_str_hash.strhash
 ifeq ($(with_transcoding),yes)
 TESTS += test-transcode test-dtmf-detect test-payload-tracker test-resample test-stats test-mix-buffer
+TESTS += test-evs-reframe
 ifeq ($(RTPENGINE_EXTENDED_TESTS),1)
 TESTS += test-amr-decode test-amr-encode
 endif
@@ -307,6 +308,16 @@ spandsp_send_fax_t38:	spandsp_send_fax_t38.o
 spandsp_recv_fax_t38:	spandsp_recv_fax_t38.o
 
 spandsp_raw_fax_tests: spandsp_send_fax_pcm spandsp_recv_fax_pcm spandsp_send_fax_t38 spandsp_recv_fax_t38
+
+test-evs-reframe: test-evs-reframe.o \
+	$(COMMONOBJS) \
+	../lib/bencode.o \
+	../lib/codeclib.strhash.o \
+	../lib/dtmflib.o \
+	../lib/mvr2s_x64_avx2.o \
+	../lib/mvr2s_x64_avx512.o \
+	../lib/resample.o \
+	log.o
 
 test-amr-decode: test-amr-decode.o \
 	$(COMMONOBJS) \

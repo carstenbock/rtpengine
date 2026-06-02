@@ -4824,9 +4824,36 @@ static void evs_push_frame(decoder_t *dec, char *frame_data, int bits, int is_am
 	g_queue_push_tail(out, frame);
 }
 
-static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
-	str input = *data;
+// A single EVS frame extracted from an RTP payload, identified WITHOUT touching
+// the EVS codec DSP. `frame_data` points into the working buffer passed to
+// evs_parse_payload() (which is mutated in place for the compact AMR-WB-IO
+// de-shuffle), so it is only valid while that buffer is.
+struct evs_io_frame {
+	bool is_amr;     // true: AMR-WB IO frame; false: native EVS primary frame
+	int mode;        // lower nibble of the ToC (EVS or AMR-WB-IO mode index)
+	int bits;        // number of significant speech bits in this frame
+	int q_bit;
+	str frame_data;  // octet-aligned speech bits (post de-shuffle for compact IO)
+};
+
+typedef void (*evs_frame_fn)(void *ctx, const struct evs_io_frame *frame);
+
+// Parse an EVS RTP payload (compact or header-full) into individual frames,
+// invoking `cb` once per frame, WITHOUT instantiating or calling the EVS codec
+// DSP. This is the pure-C payload identification used by both the legacy DSP
+// decode path and the licensing-safe re-frame paths (3GPP TS 26.445 Annex A).
+//
+// `work` is parsed in place: the compact AMR-WB-IO format requires an in-place
+// bit de-shuffle, so callers that must preserve the original RTP payload have
+// to pass a writable copy. On return *cmr_out holds the received CMR byte
+// (0xff = none). Returns 0 on success, -1 on a malformed payload (in which case
+// `cb` may already have been invoked for the frames parsed before the error,
+// matching the previous streaming behaviour).
+static int evs_parse_payload(str work, evs_frame_fn cb, void *ctx, unsigned char *cmr_out) {
+	str input = work;
 	const char *err = NULL;
+
+	*cmr_out = 0xff;
 
 	if (input.len == 0)
 		return 0;
@@ -4836,7 +4863,7 @@ static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	unsigned char cmr = 0xff;
 	// check for single frame in compact format
 	int32_t mode = evs_mode_from_bytes(input.len);
-	int is_amr, bits, q_bit;
+	int is_amr = 0, bits = 0, q_bit = 0;
 	if ((mode & 0xff0000ff) == 0) {
 		// special case, clause A.2.1.3
 		if ((input.s[0] & 0x80)) {
@@ -4907,8 +4934,16 @@ static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 	while (1) {
 		// process frame if we have one; we don't have one if
 		// this is the first iteration and this is not a compact frame
-		if (mode != -1)
-			evs_push_frame(dec, frame_data.s, bits, is_amr, mode, q_bit, out);
+		if (mode != -1) {
+			struct evs_io_frame frame = {
+				.is_amr = is_amr,
+				.mode = mode,
+				.bits = bits,
+				.q_bit = q_bit,
+				.frame_data = frame_data,
+			};
+			cb(ctx, &frame);
+		}
 
 		// anything left? we break here in compact mode
 		if (!input.len)
@@ -4934,15 +4969,370 @@ static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
 			goto err;
 	}
 
-	if (cmr != 0xff)
-		decoder_event(dec, CE_EVS_CMR_RECV, GUINT_TO_POINTER(cmr));
-
+	*cmr_out = cmr;
 	return 0;
 
 err:
 	if (err)
 		ilog(LOG_WARN | LOG_FLAG_LIMIT, "Error unpacking EVS packet: %s", err);
 	return -1;
+}
+
+struct evs_dsp_decode_ctx {
+	decoder_t *dec;
+	GQueue *out;
+};
+static void evs_dsp_decode_frame(void *p, const struct evs_io_frame *frame) {
+	struct evs_dsp_decode_ctx *ctx = p;
+	// this is the only consumer that invokes the patent-encumbered EVS DSP
+	evs_push_frame(ctx->dec, frame->frame_data.s, frame->bits, frame->is_amr,
+			frame->mode, frame->q_bit, ctx->out);
+}
+
+static int evs_decoder_input(decoder_t *dec, const str *data, GQueue *out) {
+	struct evs_dsp_decode_ctx ctx = { .dec = dec, .out = out };
+	unsigned char cmr;
+	if (evs_parse_payload(*data, evs_dsp_decode_frame, &ctx, &cmr))
+		return -1;
+
+	if (cmr != 0xff)
+		decoder_event(dec, CE_EVS_CMR_RECV, GUINT_TO_POINTER(cmr));
+
+	return 0;
+}
+
+
+/*
+ * Licensing-safe EVS AMR-WB-IO <-> AMR-WB (RFC 4867) re-framing.
+ *
+ * EVS AMR-WB-IO speech/SID frames are bit-identical to AMR-WB frames
+ * (3GPP TS 26.445 Annex A, TS 26.453), so bridging an EVS leg that is
+ * constrained to AMR-WB IO to an AMR-WB (or, via the existing AMR-WB<->G.722
+ * transcoder, a G.722) leg is a pure packetization-format translation. None of
+ * the functions below instantiate or call the EVS codec DSP. Native EVS primary
+ * frames cannot be re-framed and are rejected here (the caller must drop them
+ * and must never feed them to the DSP on this path).
+ */
+
+// AMR-WB mode (0..8) -> 3-bit compact EVS AMR-WB-IO CMR index. Modes 3 (14.25)
+// and 6 (19.85) are not representable in the compact CMR set, so they map to
+// "no request" (index 7). Inverse of evs_amr_io_compact_cmr[]. TS 26.445
+// A.2.2.1.1.
+static const unsigned char amr_wb_to_evs_io_compact_cmr[9] = {
+	0, // 6.60
+	1, // 8.85
+	2, // 12.65
+	7, // 14.25 - not representable in compact CMR
+	3, // 15.85
+	4, // 18.25
+	7, // 19.85 - not representable in compact CMR
+	5, // 23.05
+	6, // 23.85
+};
+
+// Map a received EVS CMR byte to a 4-bit AMR-WB CMR nibble (0..8, or 0xf = no
+// request). Only AMR-WB-IO mode requests (EVS CMR type 1, byte 0x90|mode) carry
+// over; anything else becomes "no request".
+static unsigned char evs_cmr_to_amr_wb(unsigned char evs_cmr) {
+	if (evs_cmr == 0xff)
+		return 0xf;
+	if ((evs_cmr & 0xf0) == 0x90) {
+		unsigned char m = evs_cmr & 0xf;
+		if (m <= 8)
+			return m;
+	}
+	return 0xf;
+}
+
+#define EVS_REFRAME_MAX_FRAMES 24
+
+struct evs_io_collect {
+	struct evs_io_frame frames[EVS_REFRAME_MAX_FRAMES];
+	int n;
+	bool overflow;
+	bool primary; // a native EVS primary frame was encountered
+};
+static void evs_io_collect_cb(void *p, const struct evs_io_frame *f) {
+	struct evs_io_collect *c = p;
+	if (!f->is_amr)
+		c->primary = true;
+	if (c->n >= (int) G_N_ELEMENTS(c->frames)) {
+		c->overflow = true;
+		return;
+	}
+	c->frames[c->n++] = *f;
+}
+
+// MSB-first bit writer over a fixed buffer (which must be pre-zeroed).
+struct evs_bitwriter {
+	unsigned char *buf;
+	size_t cap;
+	size_t bitpos;
+	bool ovf;
+};
+static void evs_bw_bit(struct evs_bitwriter *bw, int v) {
+	size_t byte = bw->bitpos >> 3;
+	if (byte >= bw->cap) {
+		bw->ovf = true;
+		bw->bitpos++;
+		return;
+	}
+	if (v)
+		bw->buf[byte] |= 0x80 >> (bw->bitpos & 7);
+	bw->bitpos++;
+}
+static void evs_bw_val(struct evs_bitwriter *bw, uint32_t val, int nbits) {
+	for (int i = nbits - 1; i >= 0; i--)
+		evs_bw_bit(bw, (val >> i) & 1);
+}
+static void evs_bw_stream(struct evs_bitwriter *bw, const unsigned char *src, int nbits) {
+	for (int i = 0; i < nbits; i++)
+		evs_bw_bit(bw, (src[i >> 3] >> (7 - (i & 7))) & 1);
+}
+
+static int amr_wb_pack_octet(char *out, size_t out_size, unsigned char cmr,
+		const struct evs_io_frame *f, int n)
+{
+	size_t need = 1 + n;
+	for (int i = 0; i < n; i++)
+		need += (f[i].bits + 7) / 8;
+	if (need > out_size)
+		return -1;
+	unsigned char *o = (unsigned char *) out;
+	size_t pos = 0;
+	o[pos++] = (cmr & 0xf) << 4; // CMR + 4 reserved/padding bits
+	for (int i = 0; i < n; i++)
+		o[pos++] = (i < n - 1 ? 0x80 : 0) | ((f[i].mode & 0xf) << 3) | ((f[i].q_bit & 1) << 2);
+	for (int i = 0; i < n; i++) {
+		int nb = (f[i].bits + 7) / 8;
+		memcpy(o + pos, f[i].frame_data.s, nb);
+		// zero the don't-care trailing padding bits (RFC 4867 §4.3) so the
+		// output is canonical regardless of leftover de-shuffle bits
+		if (f[i].bits % 8)
+			o[pos + nb - 1] &= 0xff << (8 - (f[i].bits % 8));
+		pos += nb;
+	}
+	return pos;
+}
+
+static int amr_wb_pack_be(char *out, size_t out_size, unsigned char cmr,
+		const struct evs_io_frame *f, int n)
+{
+	memset(out, 0, out_size);
+	struct evs_bitwriter bw = { .buf = (unsigned char *) out, .cap = out_size };
+	evs_bw_val(&bw, cmr & 0xf, 4);
+	for (int i = 0; i < n; i++) {
+		evs_bw_bit(&bw, i < n - 1 ? 1 : 0); // F
+		evs_bw_val(&bw, f[i].mode & 0xf, 4); // FT
+		evs_bw_bit(&bw, f[i].q_bit & 1); // Q
+	}
+	for (int i = 0; i < n; i++)
+		evs_bw_stream(&bw, (const unsigned char *) f[i].frame_data.s, f[i].bits);
+	if (bw.ovf)
+		return -1;
+	return (bw.bitpos + 7) / 8;
+}
+
+// Re-frame an EVS AMR-WB-IO RTP payload into an RFC 4867 AMR-WB RTP payload.
+// `out` must hold at least in->len + 8 bytes. Returns the output length, 0 for
+// an empty input, or -1 if the payload cannot be re-framed (malformed, too many
+// frames, or it contains a native EVS primary frame).
+int codec_evs_io_to_amr_wb(const str *in, char *out, size_t out_size, bool octet_aligned) {
+	if (!in || !in->s)
+		return -1;
+	if (in->len == 0)
+		return 0;
+
+	// parse on a private copy: the compact AMR-WB-IO de-shuffle mutates in place
+	// and reads one byte past the frame, so keep a zeroed look-ahead byte
+	char workbuf[1504];
+	if (in->len > 1500)
+		return -1;
+	memcpy(workbuf, in->s, in->len);
+	memset(workbuf + in->len, 0, sizeof(workbuf) - in->len);
+	str work = STR_LEN(workbuf, in->len);
+
+	struct evs_io_collect c = { 0 };
+	unsigned char evs_cmr;
+	if (evs_parse_payload(work, evs_io_collect_cb, &c, &evs_cmr))
+		return -1;
+	if (c.primary) {
+		ilog(LOG_WARN | LOG_FLAG_LIMIT,
+				"Refusing to re-frame native EVS primary frame to AMR-WB "
+				"(EVS DSP not invoked); dropping");
+		return -1;
+	}
+	if (c.overflow)
+		return -1;
+	if (c.n == 0)
+		return 0;
+
+	unsigned char amr_cmr = evs_cmr_to_amr_wb(evs_cmr);
+
+	if (octet_aligned)
+		return amr_wb_pack_octet(out, out_size, amr_cmr, c.frames, c.n);
+	return amr_wb_pack_be(out, out_size, amr_cmr, c.frames, c.n);
+}
+
+// Parse an RFC 4867 AMR-WB RTP payload into individual frames (DSP-free).
+// Speech bits are copied, octet-aligned and MSB-first, into `speech_buf` with a
+// one-byte zero pad after each frame (needed by the compact EVS-IO shuffle
+// look-ahead). Returns 0 on success, -1 on a malformed payload.
+static int amr_wb_parse(const str *in, bool octet_aligned, struct evs_io_frame *frames,
+		int max_frames, unsigned char *speech_buf, size_t speech_buf_size,
+		int *n_out, unsigned char *amr_cmr_out)
+{
+	bitstr d;
+	bitstr_init(&d, in);
+
+	unsigned char cmr_chr[2];
+	str cmr = STR_CONST_BUF(cmr_chr);
+	if (bitstr_shift_ret(&d, 4, &cmr))
+		return -1;
+	*amr_cmr_out = cmr_chr[0] >> 4;
+	if (octet_aligned && bitstr_shift(&d, 4))
+		return -1;
+
+	unsigned char tocs[EVS_REFRAME_MAX_FRAMES];
+	int ntoc = 0;
+	while (1) {
+		unsigned char toc_byte[2];
+		str toc_entry = STR_CONST_BUF(toc_byte);
+		if (bitstr_shift_ret(&d, 6, &toc_entry))
+			return -1;
+		if (octet_aligned && bitstr_shift(&d, 2))
+			return -1;
+		if (ntoc >= max_frames)
+			return -1;
+		tocs[ntoc++] = toc_byte[0];
+		if (!(toc_byte[0] & 0x80)) // no F bit = last entry
+			break;
+	}
+
+	size_t sp_pos = 0;
+	int nf = 0;
+	for (int i = 0; i < ntoc; i++) {
+		unsigned char ft = (tocs[i] >> 3) & 0xf;
+		unsigned char q = (tocs[i] >> 2) & 1;
+		if (ft == 14 || ft == 15) // NO_DATA / SPEECH_LOST: nothing to re-frame
+			continue;
+		if (ft > 9)
+			return -1;
+		int bits = evs_mode_bits[1][ft];
+		if (bits == 0)
+			return -1;
+		int nbytes = (bits + 7) / 8;
+		// bitstr_shift_ret may write ceil((bits+bit_offset)/8) bytes, i.e. up to
+		// nbytes+1; reserve that plus one zeroed look-ahead byte for the compact
+		// shuffle that the EVS-IO packer performs
+		if (sp_pos + nbytes + 2 > speech_buf_size)
+			return -1;
+		str frame = STR_LEN((char *) speech_buf + sp_pos, nbytes + 1);
+		if (bitstr_shift_ret(&d, bits, &frame))
+			return -1;
+		if (octet_aligned && (bits % 8) != 0 && bitstr_shift(&d, 8 - (bits % 8)))
+			return -1;
+		speech_buf[sp_pos + nbytes] = 0; // look-ahead pad for the compact shuffle
+		if (nf >= max_frames)
+			return -1;
+		frames[nf++] = (struct evs_io_frame) {
+			.is_amr = true,
+			.mode = ft,
+			.bits = bits,
+			.q_bit = q,
+			.frame_data = STR_LEN((char *) speech_buf + sp_pos, nbytes),
+		};
+		sp_pos += nbytes + 2;
+	}
+
+	*n_out = nf;
+	return 0;
+}
+
+// Re-frame an RFC 4867 AMR-WB RTP payload into an EVS AMR-WB-IO RTP payload.
+// Emits compact format for the common single-frame case (unless hf_only is set
+// or a frame is not representable in compact), otherwise header-full. `out`
+// must hold at least in->len + 8 bytes. Returns the output length, 0 for empty,
+// or -1 on error. Never invokes the EVS DSP.
+int codec_amr_wb_to_evs_io(const str *in, char *out, size_t out_size,
+		bool octet_aligned, bool hf_only)
+{
+	if (!in || !in->s)
+		return -1;
+	if (in->len == 0)
+		return 0;
+
+	struct evs_io_frame frames[EVS_REFRAME_MAX_FRAMES];
+	unsigned char speech_buf[1500];
+	int n = 0;
+	unsigned char amr_cmr;
+	if (amr_wb_parse(in, octet_aligned, frames, EVS_REFRAME_MAX_FRAMES,
+				speech_buf, sizeof(speech_buf), &n, &amr_cmr))
+		return -1;
+	if (n == 0)
+		return 0;
+
+	// Compact format is only used for single AMR-WB speech frames (modes 0..8,
+	// Q=1). It has unambiguous, mutually disjoint sizes. SID, Q=0, multi-frame
+	// and explicit hf-only go header-full.
+	bool compact = !hf_only && n == 1 && frames[0].q_bit == 1 && frames[0].mode <= 8;
+
+	if (compact) {
+		// mirror the compact AMR-WB-IO packing of evs_encoder_input()
+		int bits = frames[0].bits;
+		unsigned char *sp = (unsigned char *) frames[0].frame_data.s; // has look-ahead pad
+		unsigned char first = sp[0];
+		unsigned char compact_idx = (amr_cmr <= 8) ? amr_wb_to_evs_io_compact_cmr[amr_cmr] : 7;
+		unsigned char cmr_byte = (compact_idx << 5);
+		cmr_byte |= (first >> 2) & 0x1f;
+		int bytes = (bits - 5 + 7) / 8;
+		for (int i = 0; i < bytes; i++) {
+			sp[i] <<= 6;
+			sp[i] |= sp[i + 1] >> 2;
+		}
+		unsigned int first_bit_shift = (bits + 2) % 8;
+		sp[bytes - 1] &= (0xff << (8 - first_bit_shift));
+		sp[bytes - 1] |= ((first & 0x80) >> first_bit_shift);
+		if ((size_t) (1 + bytes) > out_size)
+			return -1;
+		out[0] = cmr_byte;
+		memcpy(out + 1, sp, bytes);
+		return 1 + bytes;
+	}
+
+	// header-full
+	size_t pos = 0;
+	unsigned char evs_cmr = (amr_cmr <= 8) ? (0x90 | amr_cmr) : 0xff;
+	// A header-full payload is only recognised as such if its size does not
+	// match a compact frame size (or size 7, disambiguated by the CMR bit).
+	// Prepend a CMR byte whenever omitting it would produce a colliding size.
+	int hf_payload = n; // TOC bytes
+	for (int i = 0; i < n; i++)
+		hf_payload += (frames[i].bits + 7) / 8;
+	bool emit_cmr = (evs_cmr != 0xff) || (evs_mode_from_bytes(hf_payload) != -1);
+	if (emit_cmr) {
+		if (pos >= out_size)
+			return -1;
+		out[pos++] = evs_cmr; // bit 7 set -> recognised as CMR, not TOC
+	}
+	for (int i = 0; i < n; i++) {
+		if (pos >= out_size)
+			return -1;
+		unsigned char toc = (frames[i].mode & 0xf) | 0x20; // AMR-WB-IO marker
+		if (frames[i].q_bit)
+			toc |= 0x10;
+		if (i < n - 1)
+			toc |= 0x40; // continuation
+		out[pos++] = toc;
+	}
+	for (int i = 0; i < n; i++) {
+		int nbytes = (frames[i].bits + 7) / 8;
+		if (pos + nbytes > out_size)
+			return -1;
+		memcpy(out + pos, frames[i].frame_data.s, nbytes);
+		pos += nbytes;
+	}
+	return pos;
 }
 
 
